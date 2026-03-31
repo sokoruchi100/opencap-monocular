@@ -1069,7 +1069,12 @@ def getVideoRotation(videoPath):
                 else:
                     rotation = 0
             else:
-                raise Exception("no rotation info")
+                # Check MP4/generic stream-level rotation tag
+                stream_tags = meta["streams"][0].get("tags", {})
+                if "rotate" in stream_tags:
+                    rotation = stream_tags["rotate"]
+                else:
+                    raise Exception("no rotation info")
         except:
             rotation = (
                 90  # upright is 90, and intrinsics were captured in that orientation

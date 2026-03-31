@@ -114,12 +114,15 @@ def run_mono_standalone(
         Dictionary with results similar to the API response
     """
     # Load metadata
-    with open(metadata_path, "r") as f:
-        metadata = yaml.safe_load(f)
+    metadata = {}
+    if os.path.exists(metadata_path):
+        with open(metadata_path, "r") as f:
+            metadata = yaml.safe_load(f)
 
     if not intrinsics_path:
         intrinsics_path = resolve_intrinsics_from_metadata(metadata, repo_path)
 
+    # Defaults
     height_m = metadata.get("height_m", 1.70)  # Default height if not found
     mass_kg = metadata.get("mass_kg", 70.0)  # Default mass if not found
     sex = metadata.get("sex", "male")  # Default sex if not found
@@ -209,10 +212,10 @@ def run_mono_standalone(
     rotation = getVideoRotation(video_path)
     logger.info(f"Rotation: {rotation}")
 
-    # Convert MOV to AVI
-    if video_path.lower().endswith(".mov"):
-        logger.info(f"Converting MOV file to AVI: {video_path}")
-        video_path = convert_to_avi(video_path)
+    # Convert MOV/MP4 to AVI, applying rotation correction if needed
+    if video_path.lower().endswith((".mov", ".mp4")):
+        logger.info(f"Converting video file to AVI: {video_path}")
+        video_path = convert_to_avi(video_path, rotation=rotation)
         logger.info(f"Conversion complete. New video path: {video_path}")
 
     # Run WHAM (match flow: estimate_local_only for consistent world/cam coordinates)
