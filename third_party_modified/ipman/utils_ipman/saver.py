@@ -98,6 +98,6 @@ class CheckpointSaver:
                     )
         checkpoint_list = sorted(checkpoint_list)
         self.latest_checkpoint = (
-            None if (len(checkpoint_list) is 0) else checkpoint_list[-1]
+            None if (len(checkpoint_list) == 0) else checkpoint_list[-1]
         )
         return
