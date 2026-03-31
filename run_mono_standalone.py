@@ -459,9 +459,9 @@ if __name__ == "__main__":
     # Example usage - modify these paths as needed
     # You can set breakpoints anywhere in the run_mono_standalone function
 
-    video_path = "paolo3.mov"
-    metadata_path = "paolo.yaml"
-    calib_path = "calib.txt"
+    video_path = "/ceph/Dataset/QEVD-FIT-COACH/long_range_videos/0000.mp4"
+    metadata_path = "" # none exists
+    calib_path = "" # none exists
     # intrinsics_path: omit or None to resolve from metadata iphoneModel.Cam0 (mono_api behavior)
 
     # Optional: Initialize WHAM model (similar to API startup)
