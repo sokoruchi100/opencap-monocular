@@ -785,6 +785,8 @@ class OptimizePose:
                 self.smpl_model.bm.faces, device=self.device
             )
             self.stability_loss_init = self.loss_stability(scale=1).clone().detach()
+            if torch.isnan(self.stability_loss_init) or self.stability_loss_init == 0:
+                self.stability_loss_init = torch.tensor(1.0, device=self.device)
         else:
             self.com = torch.zeros((self.n_frames, 3), device=self.device)
 
@@ -1127,9 +1129,9 @@ class OptimizePose:
         polygon_normal = torch.cross(
             poly_vectors, y_axis.expand_as(poly_vectors), dim=-1
         )
-        polygon_normal = polygon_normal / torch.norm(
+        polygon_normal = polygon_normal / (torch.norm(
             polygon_normal, dim=-1, keepdim=True
-        )  # Normalize
+        ) + 1e-8)  # Normalize (epsilon prevents NaN when foot keypoints are collinear)
 
         # Step 2: Compute midpoints of polygon edges
         midpoints = (
