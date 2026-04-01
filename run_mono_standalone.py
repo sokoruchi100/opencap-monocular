@@ -26,7 +26,7 @@ from utils.convert_to_avi import convert_to_avi
 from utils.utilsCameraPy3 import getVideoRotation
 from utils.tracking_filters import InsufficientFullBodyKeypointsError
 
-# Used to extract the Height(meters), Mass(kilograms), and gender(Male/Female) of Subjects
+# Used to extract the height_m, mass_kg, and sex, of Subjects
 METADATA_PATH = "/ceph/Dataset/QEVD-FIT-COACH/QEVD-FIT-COACH_body_info.json"
 
 # Import enhanced logging (optional)
@@ -44,11 +44,11 @@ repo_path = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 def generate_request_hash(video_path, metadata):
     """Generate a unique hash to identify a processing request based on its parameters."""
     # Create a string with all relevant parameters
-    # Use 'gender' key consistently, providing defaults if missing
-    gender = metadata.get("gender", "unknown")
-    height = metadata.get("height", 0.0)
-    mass = metadata.get("mass", 0.0)
-    key_string = f"{video_path}_{height}_{mass}_{gender}"
+    # Use 'sex' key consistently, providing defaults if missing
+    sex = metadata.get("sex", "unknown")
+    height_m = metadata.get("height_m", 0.0)
+    mass_kg = metadata.get("mass_kg", 0.0)
+    key_string = f"{video_path}_{height_m}_{mass_kg}_{sex}"
     # Generate a hash
     return hashlib.md5(key_string.encode()).hexdigest()
 
@@ -65,7 +65,7 @@ def resolve_intrinsics_from_metadata(metadata: dict, repo_path: str) -> str:
         pass
 
     default_intrinsics = os.path.join(
-        repo_path, "examples/Intrinsics/iphone12Pro_intrinsics.pickle"
+        repo_path, "camera_intrinsics/iPhone13,3/Deployed/cameraIntrinsics.pickle"
     )
     if device_model:
         device_intrinsics = os.path.join(
@@ -124,14 +124,18 @@ def run_mono_standalone(
         with open(metadata_path, "r", encoding='utf-8') as f:
             metadata = json.load(f).get(video_name)
 
+    # Rename keys based on mapping; keep original if not in mapping
+    mapping = {'height': 'height_m', 'mass': 'mass_kg', 'gender': 'sex'}
+    metadata = {mapping.get(k, k): v for k, v in metadata.items()}
+
     if not intrinsics_path:
         intrinsics_path = resolve_intrinsics_from_metadata(metadata, repo_path)
 
     # Defaults
-    height_m = metadata.get("height", 1.70)  # Default height if not found
-    mass_kg = metadata.get("mass", 70.0)  # Default mass if not found
-    gender = metadata.get("gender", "male")  # Default gender if not found
-    logger.info(f"Height: {height_m} m, Mass: {mass_kg} kg, gender: {gender}")
+    height_m = metadata.get("height_m", 1.70)  # Default height_m if not found
+    mass_kg = metadata.get("mass_kg", 70.0)  # Default mass_kg if not found
+    sex = metadata.get("sex", "male")  # Default sex if not found
+    logger.info(f"height: {height_m} m, mass: {mass_kg} kg, sex: {sex}")
 
     # If rerun is False, check for cached results
     if not rerun:
@@ -277,7 +281,7 @@ def run_mono_standalone(
         ),  # Use folder name instead of video filename
         "height_m": height_m,
         "mass_kg": mass_kg,
-        "gender": gender,
+        "sex": sex,
         "intrinsics_pth": intrinsics_path,
         "run_opensim_original_wham": True,
         "run_opensim_opt2": True,

@@ -22,6 +22,7 @@ BBOX_CONF = 0.5
 TRACKING_THR = 0.1
 MINIMUM_FRMAES = 30
 MINIMUM_JOINTS = 6
+TRACK_BUFFER = 30  # frames to keep a lost track alive before retiring it
 
 class DetectionModel(object):
     def __init__(
@@ -46,6 +47,10 @@ class DetectionModel(object):
         self.next_id = 0
         self.frame_id = 0
         self.pose_results_last = []
+        # Buffer of lost tracks: {track_id: {'result': pose_result, 'age': int}}
+        # A track stays here for up to TRACK_BUFFER frames after it was last seen,
+        # giving the matcher a chance to re-associate it if the person reappears.
+        self.lost_tracks = {}
         self.tracking_results = {
             'id': [],
             'frame_id': [],
@@ -94,29 +99,58 @@ class DetectionModel(object):
             outputs=None)
         
         # person identification
+        # Build the candidate list: active tracks from last frame + buffered lost tracks.
+        # get_track_id matches current detections against this list by IoU, re-using
+        # the track_id of whichever candidate overlaps most.
+        candidates = self.pose_results_last + [
+            entry['result'] for entry in self.lost_tracks.values()
+        ]
         pose_results, self.next_id = get_track_id(
             pose_results,
-            self.pose_results_last,
+            candidates,
             self.next_id,
             use_oks=False,
             tracking_thr=TRACKING_THR,
             use_one_euro=True,
             fps=fps)
-        
+
+        # Find which track IDs were matched this frame
+        matched_ids = {r['track_id'] for r in pose_results if r['track_id'] != -1}
+
+        # Age all lost tracks by 1; drop any that have exceeded the buffer limit
+        expired = [tid for tid, entry in self.lost_tracks.items()
+                   if entry['age'] >= TRACK_BUFFER]
+        for tid in expired:
+            del self.lost_tracks[tid]
+        for entry in self.lost_tracks.values():
+            entry['age'] += 1
+
+        # Remove re-matched tracks from the lost buffer (they're active again)
+        for tid in matched_ids:
+            self.lost_tracks.pop(tid, None)
+
         for pose_result in pose_results:
             n_valid = (pose_result['keypoints'][:, -1] > VIS_THRESH).sum()
             if n_valid < MINIMUM_JOINTS: continue
-            
+
             _id = pose_result['track_id']
             xyxy = pose_result['bbox']
             bbox = self.xyxy_to_cxcys(xyxy)
-            
+
             self.tracking_results['id'].append(_id)
             self.tracking_results['frame_id'].append(self.frame_id)
             self.tracking_results['bbox'].append(bbox)
             self.tracking_results['keypoints'].append(pose_result['keypoints'])
-        
+
         self.frame_id += 1
+
+        # Move tracks that were active last frame but not seen this frame into the buffer
+        active_last_ids = {r['track_id'] for r in self.pose_results_last}
+        newly_lost = active_last_ids - matched_ids
+        for r in self.pose_results_last:
+            if r['track_id'] in newly_lost and r['track_id'] not in self.lost_tracks:
+                self.lost_tracks[r['track_id']] = {'result': r, 'age': 1}
+
         self.pose_results_last = pose_results
     
     def process(self, fps):

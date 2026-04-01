@@ -125,10 +125,12 @@ def handle_multi_person_tracking(
             all_data_with_nan_list[i][personframes_idx] = data
         all_bbox = np.stack(bbFromKeypoints)  # Shape (n_people, nFrames, 4)
 
+        # OLD - picks the single fram with the biggest bbox area
+        # TODO: Comment this block out and use longest video instead
         max_area, max_idx, person_idx = get_largest_bounding_box(
             all_data_with_nan, all_bbox, conf_thresh=confidenceThresholdForBB
         )
-
+   
         if max_area == 0.0:
             key2D = np.zeros((num_kpts, nFrames, 2))
             confidence = np.zeros((num_kpts, nFrames))

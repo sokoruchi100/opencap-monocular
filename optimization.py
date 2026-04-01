@@ -307,8 +307,7 @@ def run_optimization(
     beta = ut.compute_mean_beta(wham_result["betas"])
 
     # Create SMPL model
-    gender = "female" if sex == "f" else "male"
-    smpl_model, _ = ut.load_smpl(device=device, gender=gender)
+    smpl_model, _ = ut.load_smpl(device=device, gender=sex)
 
     # Preallocate tensors for camera extrinsics and 3D keypoints
     n_frames = len(opencap_mono_frame_range_wham_ref)
