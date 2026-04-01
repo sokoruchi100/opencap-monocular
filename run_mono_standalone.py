@@ -15,6 +15,7 @@ from loguru import logger
 from hashlib import md5
 from pathlib import Path
 from typing import Optional
+import json
 
 # Import the same modules used in mono_api.py
 from optimization import run_optimization
@@ -24,6 +25,9 @@ from visualization.automation import automate_recording
 from utils.convert_to_avi import convert_to_avi
 from utils.utilsCameraPy3 import getVideoRotation
 from utils.tracking_filters import InsufficientFullBodyKeypointsError
+
+# Used to extract the Height(meters), Mass(kilograms), and gender(Male/Female) of Subjects
+METADATA_PATH = "/ceph/Dataset/QEVD-FIT-COACH/QEVD-FIT-COACH_body_info.json"
 
 # Import enhanced logging (optional)
 try:
@@ -40,11 +44,11 @@ repo_path = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 def generate_request_hash(video_path, metadata):
     """Generate a unique hash to identify a processing request based on its parameters."""
     # Create a string with all relevant parameters
-    # Use 'sex' key consistently, providing defaults if missing
-    sex = metadata.get("sex", "unknown")
-    height = metadata.get("height_m", 0.0)
-    mass = metadata.get("mass_kg", 0.0)
-    key_string = f"{video_path}_{height}_{mass}_{sex}"
+    # Use 'gender' key consistently, providing defaults if missing
+    gender = metadata.get("gender", "unknown")
+    height = metadata.get("height", 0.0)
+    mass = metadata.get("mass", 0.0)
+    key_string = f"{video_path}_{height}_{mass}_{gender}"
     # Generate a hash
     return hashlib.md5(key_string.encode()).hexdigest()
 
@@ -101,7 +105,7 @@ def run_mono_standalone(
 
     Args:
         video_path: Path to the input video file
-        metadata_path: Path to the metadata YAML file
+        metadata_path: Path to the metadata JSON file
         calib_path: Path to the calibration file
         intrinsics_path: Path to intrinsics pickle; if None or empty, resolved from
             metadata iphoneModel.Cam0 like the API (camera_intrinsics/.../cameraIntrinsics.pickle).
@@ -115,18 +119,19 @@ def run_mono_standalone(
     """
     # Load metadata
     metadata = {}
+    video_name = os.path.basename(video_path).split(".")[0]
     if os.path.exists(metadata_path):
-        with open(metadata_path, "r") as f:
-            metadata = yaml.safe_load(f)
+        with open(metadata_path, "r", encoding='utf-8') as f:
+            metadata = json.load(f).get(video_name)
 
     if not intrinsics_path:
         intrinsics_path = resolve_intrinsics_from_metadata(metadata, repo_path)
 
     # Defaults
-    height_m = metadata.get("height_m", 1.70)  # Default height if not found
-    mass_kg = metadata.get("mass_kg", 70.0)  # Default mass if not found
-    sex = metadata.get("sex", "male")  # Default sex if not found
-    logger.info(f"Height: {height_m} m, Mass: {mass_kg} kg, Sex: {sex}")
+    height_m = metadata.get("height", 1.70)  # Default height if not found
+    mass_kg = metadata.get("mass", 70.0)  # Default mass if not found
+    gender = metadata.get("gender", "male")  # Default gender if not found
+    logger.info(f"Height: {height_m} m, Mass: {mass_kg} kg, gender: {gender}")
 
     # If rerun is False, check for cached results
     if not rerun:
@@ -142,7 +147,6 @@ def run_mono_standalone(
 
                     if stored_hash == request_hash:
                         logger.info(f"Found cached results in {case_dir}")
-                        video_name = os.path.basename(video_path).split(".")[0]
                         results_path = os.path.join(results_dir, case_dir, video_name)
 
                         # Check if key files exist
@@ -215,7 +219,7 @@ def run_mono_standalone(
     # Convert MOV/MP4 to AVI, applying rotation correction if needed
     if video_path.lower().endswith((".mov", ".mp4")):
         logger.info(f"Converting video file to AVI: {video_path}")
-        video_path = convert_to_avi(video_path, rotation=rotation)
+        video_path = convert_to_avi(video_path, outputPath=f"output_videos/{video_name}.avi", rotation=rotation)
         logger.info(f"Conversion complete. New video path: {video_path}")
 
     # Run WHAM (match flow: estimate_local_only for consistent world/cam coordinates)
@@ -273,7 +277,7 @@ def run_mono_standalone(
         ),  # Use folder name instead of video filename
         "height_m": height_m,
         "mass_kg": mass_kg,
-        "sex": sex,
+        "gender": gender,
         "intrinsics_pth": intrinsics_path,
         "run_opensim_original_wham": True,
         "run_opensim_opt2": True,
@@ -463,7 +467,6 @@ if __name__ == "__main__":
     # You can set breakpoints anywhere in the run_mono_standalone function
 
     video_path = "/ceph/Dataset/QEVD-FIT-COACH/long_range_videos/0000.mp4"
-    metadata_path = "" # none exists
     calib_path = "" # none exists
     # intrinsics_path: omit or None to resolve from metadata iphoneModel.Cam0 (mono_api behavior)
 
@@ -480,7 +483,7 @@ if __name__ == "__main__":
     # Run the pipeline
     result = run_mono_standalone(
         video_path=video_path,
-        metadata_path=metadata_path,
+        metadata_path=METADATA_PATH,
         calib_path=calib_path,
         estimate_local_only=True,
         rerun=False,

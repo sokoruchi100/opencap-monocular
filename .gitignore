@@ -1,4 +1,5 @@
 fetch_demo_data_PW.sh
+output_videos/
 output/
 examples/
 checkpoints/
