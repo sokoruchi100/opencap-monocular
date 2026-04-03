@@ -102,6 +102,37 @@ def _convert_with_rotation(input_path, output_path, rotation, frame_rate=None, q
     
     return output_path
 
+def prepare_video(video_path, output_dir="output_videos"):
+    """
+    Detect rotation and convert to AVI if the input is MOV or MP4.
+
+    Call this once before segmentation so all downstream clip trimming works
+    on a consistent AVI file.
+
+    Args:
+        video_path:  path to the original video file
+        output_dir:  directory where the converted AVI is written
+
+    Returns:
+        tuple: (video_path, rotation)
+            video_path — original path if already AVI, otherwise path to the
+                         newly created AVI
+            rotation   — rotation angle in degrees detected from metadata
+                         (0, 90, 180, 270, or None)
+    """
+    from utils.utilsCameraPy3 import getVideoRotation
+
+    rotation = getVideoRotation(video_path)
+
+    if video_path.lower().endswith((".mov", ".mp4")):
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
+        avi_path = os.path.join(output_dir, f"{video_name}.avi")
+        os.makedirs(output_dir, exist_ok=True)
+        video_path = convert_to_avi(video_path, outputPath=avi_path, rotation=rotation)
+
+    return video_path, rotation
+
+
 if __name__ == "__main__":
     original_video_path = "../opencap/Data/cf9c3cfb-b532-424e-9f7e-346586d920c4/Videos/Cam0/InputMedia/tug_sideView/d01c11f9-45cd-4159-8fcd-7c611f2f620f.mov"
     output_video_path = "test_output.avi"

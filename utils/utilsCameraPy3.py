@@ -1074,13 +1074,14 @@ def getVideoRotation(videoPath):
                 if "rotate" in stream_tags:
                     rotation = stream_tags["rotate"]
                 else:
-                    raise Exception("no rotation info")
-        except:
-            rotation = (
-                90  # upright is 90, and intrinsics were captured in that orientation
-            )
-
-    return int(rotation)
+                    # No rotation tag — infer from dimensions
+                    w = meta["streams"][0].get("width", 0)
+                    h = meta["streams"][0].get("height", 0)
+                    rotation = 90 if h > w else 0
+        except: # if all else fails, assume no rotation
+            rotation = 0
+    finally:
+        return int(rotation)
 
 
 def rotateIntrinsics(CamParams, rotation, imageSize=None):

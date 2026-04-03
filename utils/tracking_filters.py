@@ -125,7 +125,7 @@ def handle_multi_person_tracking(
             all_data_with_nan_list[i][personframes_idx] = data
         all_bbox = np.stack(bbFromKeypoints)  # Shape (n_people, nFrames, 4)
 
-        # OLD - picks the single fram with the biggest bbox area
+        # OLD - picks the single frame with the biggest bbox area
         # TODO: Comment this block out and use longest video instead
         max_area, max_idx, person_idx = get_largest_bounding_box(
             all_data_with_nan, all_bbox, conf_thresh=confidenceThresholdForBB
@@ -191,6 +191,134 @@ def handle_multi_person_tracking(
             tracking_results[0] = tracking_results.pop(list(tracking_results.keys())[0])
 
     return tracking_results
+
+
+def merge_all_tracks_as_single_person(tracking_results):
+    """
+    Treat all detections in the video as belonging to one continuous person.
+
+    Since the video passed to the pipeline is already a trimmed single-exercise
+    segment (pre-segmented upstream), any separate track IDs are purely detector
+    re-IDs of the same person. Concatenate all tracks sorted by frame index and
+    place them under key 0 so downstream code sees a single continuous track.
+
+    Args:
+        tracking_results: dict of {track_id: {frame_id, keypoints, bbox, ...}}
+
+    Returns:
+        tracking_results with a single key 0 containing all frames sorted by frame_id.
+    """
+    if len(tracking_results) == 0:
+        raise ValueError("No tracking results found")
+
+    if len(tracking_results) == 1:
+        # Already one track — just make sure it's keyed as 0
+        only_key = list(tracking_results.keys())[0]
+        if only_key != 0:
+            tracking_results[0] = tracking_results.pop(only_key)
+        return tracking_results
+
+    # Collect all frames from every track
+    all_frame_ids = []
+    all_keypoints = []
+    all_bboxes = []
+
+    for values in tracking_results.values():
+        all_frame_ids.append(np.asarray(values["frame_id"]).astype(int))
+        all_keypoints.append(np.asarray(values["keypoints"]))
+        all_bboxes.append(np.asarray(values["bbox"]))
+
+    all_frame_ids = np.concatenate(all_frame_ids)
+    all_keypoints = np.concatenate(all_keypoints)
+    all_bboxes = np.concatenate(all_bboxes)
+
+    # Sort by frame index so the merged track is chronological
+    sort_idx = np.argsort(all_frame_ids)
+    all_frame_ids = all_frame_ids[sort_idx]
+    all_keypoints = all_keypoints[sort_idx]
+    all_bboxes = all_bboxes[sort_idx]
+
+    n_original = len(tracking_results)
+    logger.info(
+        f"[merge_all_tracks] Merged {n_original} track(s) → 1 continuous track "
+        f"({len(all_frame_ids)} frames, "
+        f"frames {all_frame_ids[0]}–{all_frame_ids[-1]})"
+    )
+
+    return {
+        0: {
+            "features": [],
+            "frame_id": all_frame_ids,
+            "bbox": all_bboxes,
+            "keypoints": all_keypoints,
+        }
+    }
+
+
+def merge_tracks_by_gap(tracking_results, max_gap_frames=60):
+    """
+    Post-hoc gap stitching for single-person videos.
+
+    After the track buffer has already re-associated brief dropouts during
+    detection, any remaining separate tracks are inspected here. Consecutive
+    tracks whose gap is <= max_gap_frames are merged (they represent the same
+    continuous motion interrupted by a detection dropout that slipped through
+    the buffer). Tracks with a larger gap are kept separate — the person
+    genuinely left the frame and returned or became occluded, so their motion is a distinct episode that should be processed independently.
+
+    Args:
+        tracking_results: dict of {track_id: {frame_id, keypoints, bbox, ...}}
+        max_gap_frames: maximum inter-track gap (in frames) to merge across.
+                        Should match or slightly exceed TRACK_BUFFER in detector.py.
+
+    Returns:
+        tracking_results with merged tracks, renumbered sequentially from 0.
+    """
+    if len(tracking_results) <= 1:
+        return tracking_results
+
+    # Sort tracks chronologically by their first frame
+    sorted_tracks = sorted(
+        tracking_results.items(),
+        key=lambda x: int(x[1]["frame_id"][0])
+    )
+
+    segments = []          # list of finished track dicts
+    _, current = sorted_tracks[0]
+
+    for _, nxt in sorted_tracks[1:]:
+        current_last  = int(current["frame_id"][-1])
+        next_first    = int(nxt["frame_id"][0])
+        gap           = next_first - current_last - 1
+
+        if gap <= max_gap_frames:
+            # Brief dropout — same continuous motion, merge the two tracks
+            logger.info(
+                f"[gap_stitch] Merging tracks: gap={gap} frames "
+                f"(frames {current_last}→{next_first}), threshold={max_gap_frames}"
+            )
+            for key in ("frame_id", "keypoints", "bbox"):
+                if key in current and key in nxt:
+                    current[key] = np.concatenate([current[key], nxt[key]])
+            # features is populated later by the extractor, keep as empty list
+        else:
+            # Genuine absence — person left and returned, keep as separate segment
+            logger.info(
+                f"[gap_stitch] Keeping gap as segment boundary: gap={gap} frames "
+                f"(frames {current_last}→{next_first}), threshold={max_gap_frames}"
+            )
+            segments.append(current)
+            current = nxt
+
+    segments.append(current)
+
+    # Renumber sequentially from 0 so downstream code gets clean keys
+    merged = {i: seg for i, seg in enumerate(segments)}
+    logger.info(
+        f"[gap_stitch] {len(tracking_results)} tracks → {len(merged)} segment(s) "
+        f"after stitching (max_gap={max_gap_frames} frames)"
+    )
+    return merged
 
 
 def filter_frames_by_bbox_height(

@@ -22,9 +22,10 @@ from optimization import run_optimization
 from WHAM.demo import main_wham
 from visualization.utils import generateVisualizerJson
 from visualization.automation import automate_recording
-from utils.convert_to_avi import convert_to_avi
+from utils.convert_to_avi import convert_to_avi, prepare_video
 from utils.utilsCameraPy3 import getVideoRotation
 from utils.tracking_filters import InsufficientFullBodyKeypointsError
+from utils.utils_activity_classification import segment_session_video
 
 # Used to extract the height_m, mass_kg, and sex, of Subjects
 METADATA_PATH = "/ceph/Dataset/QEVD-FIT-COACH/QEVD-FIT-COACH_body_info.json"
@@ -216,254 +217,171 @@ def run_mono_standalone(
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video file does not exist: {video_path}")
 
-    # Determine video rotation
-    rotation = getVideoRotation(video_path)
-    logger.info(f"Rotation: {rotation}")
+    # Detect rotation and convert to AVI once before segmentation.
+    # Each segment clip is then trimmed from this AVI.
+    video_path, rotation = prepare_video(video_path, output_dir="output_videos")
+    logger.info(f"Rotation: {rotation} | video ready at: {video_path}")
 
-    # Convert MOV/MP4 to AVI, applying rotation correction if needed
-    if video_path.lower().endswith((".mov", ".mp4")):
-        logger.info(f"Converting video file to AVI: {video_path}")
-        video_path = convert_to_avi(video_path, outputPath=f"output_videos/{video_name}.avi", rotation=rotation)
-        logger.info(f"Conversion complete. New video path: {video_path}")
+    # --- Session segmentation -------------------------------------------------
+    # Classify overlapping windows and split the video into per-exercise segments.
+    # Each segment is processed independently through WHAM + optimization.
+    logger.info("Segmenting session video into exercise clips ...")
+    segments = segment_session_video(video_path)  # raises RuntimeError if classifier down
+    logger.info(f"Found {len(segments)} segment(s) to process.")
+    # --------------------------------------------------------------------------
 
-    # Run WHAM (match flow: estimate_local_only for consistent world/cam coordinates)
-    inputs_wham = {
-        "calib_path": calib_path,
-        "video_path": video_path,
-        "output_path": trial_path,
-        "visualize": True,
-        "save_pkl": True,
-        "run_smplify": True,
-        "rerun": rerun,
-        "estimate_local_only": estimate_local_only,
-    }
+    segment_results = []
 
-    logger.info(
-        "Starting WHAM: watch [WHAM preprocess] and [keypoint_filter] logs for "
-        "frame counts and 2D keypoint confidence."
-    )
-    try:
-        main_wham(**inputs_wham)
-    except InsufficientFullBodyKeypointsError as e:
-        logger.warning(f"Mono pipeline stopped after WHAM keypoint gate: {e}")
-        return {
-            "message": "Aborted: video does not show a full body with sufficient 2D keypoint confidence.",
-            "error": str(e),
-            "aborted": True,
-            "aborted_stage": "WHAM_preprocess",
-            "case_id": case_num,
-            "case_dir": case_dir,
-            "metadata_path": metadata_path,
-            "visualization": {"created": False, "json_path": None, "video_path": None},
+    for seg_idx, seg in enumerate(segments):
+        # WHAM names the output dir after the clip stem, so seg_dir is derived from it
+        seg_clip_path = seg["clip_path"]
+        clip_stem = os.path.splitext(os.path.basename(seg_clip_path))[0]
+        seg_dir = os.path.join(case_dir, clip_stem)
+
+        logger.info(
+            f"--- Segment {seg_idx}: '{seg['label']}' "
+            f"{seg['start_s']:.1f}–{seg['end_s']:.1f}s → {seg_dir}"
+        )
+
+        # Run WHAM — it creates case_dir/{clip_stem}/ from the clip filename
+        inputs_wham = {
+            "calib_path": calib_path,
+            "video_path": seg_clip_path,
+            "output_path": case_dir,
+            "visualize": True,
+            "save_pkl": True,
+            "run_smplify": True,
+            "rerun": rerun,
+            "estimate_local_only": estimate_local_only,
         }
-    logger.info("Wham done")
-    logger.info(f"Time taken for Wham: {time.time() - start_time:.2f} seconds")
 
-    # extract video name from video path. it's the last part of the path and without the extension
-    video_name = os.path.basename(video_path).split(".")[0]
+        logger.info(
+            f"Starting WHAM for segment {seg_idx} ..."
+        )
+        try:
+            main_wham(**inputs_wham)
+        except InsufficientFullBodyKeypointsError as e:
+            logger.warning(
+                f"Segment {seg_idx} skipped after WHAM keypoint gate: {e}"
+            )
+            segment_results.append({
+                "segment": seg_idx,
+                "label": seg["label"],
+                "aborted": True,
+                "aborted_stage": "WHAM_preprocess",
+                "error": str(e),
+            })
+            continue
+        logger.info(f"WHAM done for segment {seg_idx}. Time so far: {time.time() - start_time:.1f}s")
 
-    # Run optimization
-    results_path = (
-        trial_path  # Use trial_path directly instead of joining with video basename
-    )
-    logger.info(f"results_path: {results_path}")
+        # WHAM writes output to case_dir/seg_name/ (clip stem == seg_name)
+        results_path = seg_dir
 
-    # the result path is result path + the video name
-    results_path = os.path.join(results_path, video_name)
+        # Run optimization
+        logger.info(f"Running optimization for segment {seg_idx} ...")
+        inputs_optimization = {
+            "data_dir": results_path,
+            "trial_name": os.path.basename(results_path),
+            "height_m": height_m,
+            "mass_kg": mass_kg,
+            "sex": sex,
+            "intrinsics_pth": intrinsics_path,
+            "run_opensim_original_wham": True,
+            "run_opensim_opt2": True,
+            "use_gpu": True,
+            "static_cam": True,
+            "n_iter_opt2": 75,
+            "print_loss_terms": False,
+            "plotting": True,
+            "save_video_debug": False,
+            "output_path": results_path,
+            "video_path": seg_clip_path,
+            "activity": seg["label"],  # pass the classified label directly
+            "rotation": rotation,
+            "create_contact_visualizations": False,
+        }
 
-    # Run the optimization
-    logger.info("Running optimization...")
+        output_paths = run_optimization(**inputs_optimization)
+        logger.info(f"Optimization done for segment {seg_idx}. Time so far: {time.time() - start_time:.1f}s")
 
-    inputs_optimization = {
-        "data_dir": results_path,
-        "trial_name": os.path.basename(
-            results_path
-        ),  # Use folder name instead of video filename
-        "height_m": height_m,
-        "mass_kg": mass_kg,
-        "sex": sex,
-        "intrinsics_pth": intrinsics_path,
-        "run_opensim_original_wham": True,
-        "run_opensim_opt2": True,
-        "use_gpu": True,
-        "static_cam": True,  # Static camera (fixed in optimization.py); use False for moving camera
-        "n_iter_opt2": 75,
-        "print_loss_terms": False,
-        "plotting": True,
-        "save_video_debug": False,
-        "output_path": results_path,
-        "video_path": video_path,
-        "activity": activity,
-        "rotation": rotation,
-        "create_contact_visualizations": False,
-    }
-
-    output_paths = run_optimization(**inputs_optimization)
-
-    logger.info("Optimization done")
-    logger.info(f"Time taken for optimization: {time.time() - start_time:.2f} seconds")
-
-    logger.info(f"output_paths: {output_paths}")
-
-    # Generate visualization
-    logger.info("Generating visualization...")
-
-    # Get paths for visualization
-    model_mono_sub_folder = os.path.join(results_path, "OpenSim", "Model")
-    # Check if Model folder exists
-    if not os.path.exists(model_mono_sub_folder):
-        logger.error(f"Model folder does not exist: {model_mono_sub_folder}")
+        # Generate visualization
+        logger.info(f"Generating visualization for segment {seg_idx} ...")
+        model_mono_sub_folder = os.path.join(results_path, "OpenSim", "Model")
         model_mono_file = None
         ik_motion_file = None
-    else:
-        # find the folder which does not contain 'wham' in the name
-        model_folders = [
-            x for x in os.listdir(model_mono_sub_folder) if "wham" not in x
-        ]
-        if not model_folders:
-            logger.error(
-                f"No model folder found (excluding 'wham') in {model_mono_sub_folder}"
-            )
-            model_mono_file = None
-            ik_motion_file = None
-        else:
-            model_mono_folder = os.path.join(
-                results_path,
-                "OpenSim",
-                "Model",
-                model_folders[0],
-            )
-            model_mono_file = os.path.join(
-                model_mono_folder, "LaiUhlrich2022_scaled_no_patella.osim"
-            )
 
-            # Check if model file exists
-            if not os.path.exists(model_mono_file):
-                logger.warning(f"Model file not found: {model_mono_file}")
-                model_mono_file = None
-
-            # Get IK motion file
-            ik_motion_sub_folder = os.path.join(results_path, "OpenSim", "IK")
-            if not os.path.exists(ik_motion_sub_folder):
-                logger.error(f"IK folder does not exist: {ik_motion_sub_folder}")
-                ik_motion_file = None
-            else:
-                # find the folder which does not contain 'wham' in the name in ik_motion_sub_folder
-                ik_folders = [
-                    x for x in os.listdir(ik_motion_sub_folder) if "wham" not in x
-                ]
-                if not ik_folders:
-                    logger.error(
-                        f"No IK folder found (excluding 'wham') in {ik_motion_sub_folder}"
-                    )
-                    ik_motion_file = None
-                else:
-                    ik_motion_folder = os.path.join(
-                        results_path,
-                        "OpenSim",
-                        "IK",
-                        ik_folders[0],
-                    )
-                    # Check if IK folder exists and find .mot file
-                    if not os.path.exists(ik_motion_folder):
-                        logger.error(
-                            f"IK motion folder does not exist: {ik_motion_folder}"
-                        )
-                        ik_motion_file = None
-                    else:
-                        mot_files = [
-                            x
-                            for x in os.listdir(ik_motion_folder)
-                            if x.endswith(".mot")
-                        ]
-                        if not mot_files:
-                            logger.error(
-                                f"IK failed: No .mot file found in {ik_motion_folder}. "
-                                "This usually means IK crashed (check for 'Floating point exception' in logs)."
-                            )
-                            logger.error(
-                                f"Files in IK folder: {os.listdir(ik_motion_folder)}"
-                            )
-                            ik_motion_file = None
-                        else:
-                            ik_motion_file = os.path.join(
-                                ik_motion_folder, mot_files[0]
-                            )
-
-    output_mono_json_path = os.path.join(results_path, "mono.json")
-    output_video_path = os.path.join(results_path, "viewer_mono.webm")
-
-    logger.info(f"model_mono_file: {model_mono_file}")
-    logger.info(f"ik_motion_file: {ik_motion_file}")
-    logger.info(f"output_mono_json_path: {output_mono_json_path}")
-    logger.info(f"output_video_path: {output_video_path}")
-
-    # Generate JSON for visualization
-    jsonOutputPath = None
-    if model_mono_file and ik_motion_file:
-        try:
-            jsonOutputPath = generateVisualizerJson(
-                modelPath=model_mono_file,
-                ikPath=ik_motion_file,
-                jsonOutputPath=output_mono_json_path,
-                vertical_offset=0,
-            )
-            logger.info(f"Generated visualization JSON file at {jsonOutputPath}")
-
-            viz = False
-            if viz:
-                # Create visualization video
-                automate_recording(
-                    json_paths=[output_mono_json_path],
-                    output_video_path=output_video_path,
-                    num_loops=1,
+        if os.path.exists(model_mono_sub_folder):
+            model_folders = [x for x in os.listdir(model_mono_sub_folder) if "wham" not in x]
+            if model_folders:
+                model_mono_file = os.path.join(
+                    results_path, "OpenSim", "Model", model_folders[0],
+                    "LaiUhlrich2022_scaled_no_patella.osim",
                 )
-                logger.info("Generated visualization video")
+                if not os.path.exists(model_mono_file):
+                    model_mono_file = None
 
-            visualization_created = True
-        except Exception as e:
-            logger.error(f"Error in visualization generation: {str(e)}")
-            visualization_created = False
-    else:
-        logger.warning(
-            "Skipping visualization generation: IK failed or required files missing"
-        )
+        ik_motion_sub_folder = os.path.join(results_path, "OpenSim", "IK")
+        if os.path.exists(ik_motion_sub_folder):
+            ik_folders = [x for x in os.listdir(ik_motion_sub_folder) if "wham" not in x]
+            if ik_folders:
+                ik_motion_folder = os.path.join(results_path, "OpenSim", "IK", ik_folders[0])
+                mot_files = [x for x in os.listdir(ik_motion_folder) if x.endswith(".mot")]
+                if mot_files:
+                    ik_motion_file = os.path.join(ik_motion_folder, mot_files[0])
+                else:
+                    logger.error(f"No .mot file in {ik_motion_folder}")
+
+        output_mono_json_path = os.path.join(results_path, "mono.json")
+        output_video_path = os.path.join(results_path, "viewer_mono.webm")
+        jsonOutputPath = None
         visualization_created = False
 
-    ik_file_path = os.path.join(results_path, "ik_results.pkl")
+        if model_mono_file and ik_motion_file:
+            try:
+                jsonOutputPath = generateVisualizerJson(
+                    modelPath=model_mono_file,
+                    ikPath=ik_motion_file,
+                    jsonOutputPath=output_mono_json_path,
+                    vertical_offset=0,
+                )
+                logger.info(f"Visualization JSON: {jsonOutputPath}")
+                visualization_created = True
+            except Exception as e:
+                logger.error(f"Visualization failed for segment {seg_idx}: {e}")
+        else:
+            logger.warning(f"Skipping visualization for segment {seg_idx}: IK or model missing")
 
-    # Store the request hash before returning
+        segment_results.append({
+            "segment": seg_idx,
+            "label": seg["label"],
+            "start_s": seg["start_s"],
+            "end_s": seg["end_s"],
+            "ik_file_path": output_paths.get("ik_results_file"),
+            "trc_file_path": output_paths.get("trc_file"),
+            "scaled_model_file_path": output_paths.get("scaled_model_file"),
+            "json_file_path": jsonOutputPath,
+            "video_file_path": output_paths.get("trimmed_video"),
+            "seg_dir": seg_dir,
+            "visualization": {
+                "created": visualization_created,
+                "json_path": output_mono_json_path if visualization_created else None,
+                "video_path": output_video_path if visualization_created and os.path.exists(output_video_path) else None,
+            },
+        })
+
+    # Store request hash
     request_hash = generate_request_hash(video_path, metadata)
-    hash_file_path = os.path.join(case_dir, "request_hash.txt")
-    with open(hash_file_path, "w") as f:
+    with open(os.path.join(case_dir, "request_hash.txt"), "w") as f:
         f.write(request_hash)
-    logger.info(f"Stored request hash {request_hash} for future reference")
+    logger.info(f"Stored request hash {request_hash}")
 
-    response = {
+    return {
         "message": "Mono pipeline completed successfully!",
-        "ik_file_path": output_paths.get("ik_results_file"),
-        "json_file_path": jsonOutputPath,
-        "video_file_path": output_paths.get("trimmed_video"),
-        "trc_file_path": output_paths.get("trc_file"),
-        "scaled_model_file_path": output_paths.get("scaled_model_file"),
         "case_id": case_num,
         "case_dir": case_dir,
         "metadata_path": metadata_path,
-        "pose_pickle_path": output_paths.get("optimized_pkl"),
-        "keypoints_3d_cam_path": output_paths.get("keypoints_3d_cam_pkl"),
-        "vertices_3d_cam_path": output_paths.get("vertices_3d_cam_pkl"),
-        "visualization": {
-            "created": visualization_created,
-            "json_path": output_mono_json_path if visualization_created else None,
-            "video_path": (
-                output_video_path
-                if visualization_created and os.path.exists(output_video_path)
-                else None
-            ),
-        },
+        "segments": segment_results,
     }
-
-    return response
 
 
 if __name__ == "__main__":

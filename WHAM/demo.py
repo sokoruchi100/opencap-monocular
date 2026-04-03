@@ -18,7 +18,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'W
 
 from configs.config import get_cfg_defaults
 from utils.tracking_filters import (
-    handle_multi_person_tracking,
+    merge_all_tracks_as_single_person,
     filter_frames_by_bbox_height,
     filter_frames_by_bbox_touching_edges,
     filter_frames_by_keypoints,
@@ -137,6 +137,8 @@ def run(cfg,
 
             tracking_results = detector.process(fps)
 
+            
+
             filtering = True
             num_kpts = 133
 
@@ -151,19 +153,12 @@ def run(cfg,
                     f"after detector.process={_n_tracked_frames(tracking_results)}"
                 )
 
-                # Handle multi-person detection and select person of interest
-                tracking_results = handle_multi_person_tracking(
-                    tracking_results, video, num_kpts, length, output_pth
-                )
-
-                # make sure the tracking results is a dictionary of length 1 with the key 0 (only one person of interest)
-                if len(tracking_results) == 0:
-                    raise ValueError("No tracking results found")
-                if len(tracking_results) != 1 or list(tracking_results.keys())[0] != 0:
-                    raise ValueError("Tracking results is not a dictionary with the key 0")
-
+                # The video is a pre-segmented single-exercise clip with one person.
+                # All track IDs are re-IDs of the same person — merge everything
+                # into one continuous track under key 0.
+                tracking_results = merge_all_tracks_as_single_person(tracking_results)
                 logger.info(
-                    f"[WHAM preprocess] after handle_multi_person: {_n_tracked_frames(tracking_results)} frames"
+                    f"[WHAM preprocess] after merge: {_n_tracked_frames(tracking_results)} frames"
                 )
 
                 # Filter start and end frames based on bbox height
