@@ -233,10 +233,30 @@ def merge_all_tracks_as_single_person(tracking_results):
     all_bboxes = np.concatenate(all_bboxes)
 
     # Sort by frame index so the merged track is chronological
-    sort_idx = np.argsort(all_frame_ids)
+    sort_idx = np.argsort(all_frame_ids, kind="stable")
     all_frame_ids = all_frame_ids[sort_idx]
     all_keypoints = all_keypoints[sort_idx]
     all_bboxes = all_bboxes[sort_idx]
+
+    # Deduplicate: when the track buffer causes two tracks to overlap on the same
+    # frame, the concatenated array has duplicate frame IDs. WHAM extracts image
+    # features for each actual video frame, so the keypoints sequence must have
+    # exactly one entry per frame. Keep the detection with the largest bbox area.
+    # bbox format is (cx, cy, scale) — scale is proportional to bbox size
+    bbox_areas = all_bboxes[:, 2]
+    unique_frames, first_occurrence = np.unique(all_frame_ids, return_index=True)
+    if len(unique_frames) < len(all_frame_ids):
+        n_dupes = len(all_frame_ids) - len(unique_frames)
+        logger.info(f"[tracking] Deduplicating {n_dupes} overlapping frame(s) across merged tracks")
+        # For each unique frame, pick the detection with the largest bbox area
+        keep = np.zeros(len(all_frame_ids), dtype=bool)
+        for frame_id in unique_frames:
+            idxs = np.where(all_frame_ids == frame_id)[0]
+            best = idxs[np.argmax(bbox_areas[idxs])]
+            keep[best] = True
+        all_frame_ids = all_frame_ids[keep]
+        all_keypoints = all_keypoints[keep]
+        all_bboxes = all_bboxes[keep]
 
     n_original = len(tracking_results)
     logger.info(
