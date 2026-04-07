@@ -1,5 +1,6 @@
 import os
 import cv2
+import sys
 
 
 def convert_to_avi(inputPath, outputPath=None, frameRate=None, quality=0, rotation=None):
@@ -21,9 +22,10 @@ def convert_to_avi(inputPath, outputPath=None, frameRate=None, quality=0, rotati
     # Old version: should_rotate=True for 90/270 meant frames needed rotation to upright
     # New version: rotation=90/270 means frames are rotated, need to rotate them to upright
     # Rotation 0/180: frames are already in correct orientation, no rotation needed
+    print(f'{rotation=}')
     if rotation is not None and rotation in [90, 270]:
         return _convert_with_rotation(inputPath, outputPath, rotation, frameRate, quality)
-    else:
+    else:    
         # Use ffmpeg for simple conversion (no rotation needed for 0, 180, or None)
         cmd_fr = '' if frameRate is None else f' -r {frameRate} '
         CMD = f"ffmpeg -loglevel error -y -i {inputPath}{cmd_fr} -q:v {quality} {outputPath}"
@@ -134,6 +136,12 @@ def prepare_video(video_path, output_dir="output_videos"):
 
 
 if __name__ == "__main__":
-    original_video_path = "../opencap/Data/cf9c3cfb-b532-424e-9f7e-346586d920c4/Videos/Cam0/InputMedia/tug_sideView/d01c11f9-45cd-4159-8fcd-7c611f2f620f.mov"
-    output_video_path = "test_output.avi"
-    convert_to_avi(original_video_path, outputPath=output_video_path)
+    video_num = sys.argv[1] if len(sys.argv) > 1 else "0000"
+
+    video_path = f"/ceph/Dataset/QEVD-FIT-COACH/long_range_videos/{video_num}.mp4"
+    if not os.path.exists(video_path):
+        print(f"{video_path} does not exist")
+        exit()
+
+    output_video_path = f"/storage/Daniel/opencap-monocular/output_videos/{video_num}.avi"
+    prepare_video(video_path)

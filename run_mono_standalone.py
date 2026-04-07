@@ -11,6 +11,7 @@ import os
 import time
 import yaml
 import hashlib
+import sys
 from loguru import logger
 from hashlib import md5
 from pathlib import Path
@@ -388,7 +389,12 @@ if __name__ == "__main__":
     # Example usage - modify these paths as needed
     # You can set breakpoints anywhere in the run_mono_standalone function
 
-    video_path = "/ceph/Dataset/QEVD-FIT-COACH/long_range_videos/0000.mp4"
+    video_dir = "/ceph/Dataset/QEVD-FIT-COACH/long_range_videos/"
+    video_name = sys.argv[1] if len(sys.argv) > 1 else "0000"
+    video_path = os.path.join(video_dir, video_name + ".mp4") if os.path.isfile(os.path.join(video_dir, video_name + ".mp4")) else None
+    if not video_path:
+        logger.error(f"Video file not found: {video_path}")
+        sys.exit(1)
     calib_path = "" # none exists
     # intrinsics_path: omit or None to resolve from metadata iphoneModel.Cam0 (mono_api behavior)
 

@@ -11,7 +11,11 @@ from warnings import warn
 import ffmpeg
 import copy
 from loguru import logger
-
+from decouple import config as env_config
+import requests
+import os
+import cv2
+from ultralytics import YOLO
 
 # Bibliography:
 # [1] Sara R. Matousek M. 3D Computer Vision. January 7, 2014.
@@ -1054,34 +1058,87 @@ def calibrate_division_model(line_coordinates, y0, z_n, focal_length=1):
     return c
 
 
-def getVideoRotation(videoPath):
-    meta = ffmpeg.probe(videoPath)
+def _detect_rotation_from_person_bbox(video_path):
+    """
+    Run YOLOv8 person detection on a few sample frames and infer the video
+    rotation from the aspect ratio of the largest detected person bounding box.
+
+    A person in an upright video is tall and narrow (h >> w).
+    A person in a 90°-rotated video appears wide and short (w >> h).
+
+    Returns 0 (upright) or 90 (needs 90° CW correction), or None if no
+    person is detected.  Upside-down (180°) and left/right-sideways (90 vs
+    270) cannot be distinguished from the bbox alone; 90° is returned for
+    all sideways cases since iPhone portrait is by far the most common case.
+    """
+    yolo_ckpt = os.path.join(
+        os.path.dirname(__file__), "..", "WHAM", "checkpoints", "yolov8x.pt"
+    )
+    if not os.path.exists(yolo_ckpt):
+        logger.warning(f"[rotation] YOLOv8 checkpoint not found: {yolo_ckpt}")
+        return None
+
+    yolo = YOLO(yolo_ckpt)
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    for pct in (0.10, 0.30, 0.50):
+        pos = int(total_frames * pct)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        results = yolo(frame, classes=[0], verbose=False)  # class 0 = person
+        if not results or len(results[0].boxes) == 0:
+            continue
+
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+        areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        x1, y1, x2, y2 = boxes[areas.argmax()]
+        w, h = x2 - x1, y2 - y1
+
+        if h > w * 1.2:
+            cap.release()
+            logger.info(f"[rotation] YOLO bbox h/w={h/w:.2f} → upright (0°)")
+            return 0
+        elif w > h * 1.2:
+            cap.release()
+            logger.info(f"[rotation] YOLO bbox w/h={w/h:.2f} → sideways (90°)")
+            return 90
+
+    cap.release()
+    logger.info("[rotation] YOLO detected no clear person bbox")
+    return None
+
+
+def getVideoRotation(video_path):
+    meta = ffmpeg.probe(video_path)
     try:
         rotation = meta["format"]["tags"]["com.apple.quicktime.video-orientation"]
-    except:
-        # For AVI (after we rewrite video), no rotation paramter, so just using h and w.
-        # For now this is ok, we don't need leaning right/left for this, just need to know
-        # how to orient the pose estimation resolution parameters.
-        try:
-            if meta["format"]["format_name"] == "avi":
-                if meta["streams"][0]["height"] > meta["streams"][0]["width"]:
-                    rotation = 90
-                else:
-                    rotation = 0
-            else:
-                # Check MP4/generic stream-level rotation tag
-                stream_tags = meta["streams"][0].get("tags", {})
-                if "rotate" in stream_tags:
-                    rotation = stream_tags["rotate"]
-                else:
-                    # No rotation tag — infer from dimensions
-                    w = meta["streams"][0].get("width", 0)
-                    h = meta["streams"][0].get("height", 0)
-                    rotation = 90 if h > w else 0
-        except: # if all else fails, assume no rotation
-            rotation = 0
-    finally:
+        logger.info(f"[rotation] Apple QuickTime tag: {rotation}°")
         return int(rotation)
+    except (KeyError, TypeError):
+        pass
+
+    # Check generic MP4 stream-level rotation tag
+    stream_tags = meta.get("streams", [{}])[0].get("tags", {})
+    if "rotate" in stream_tags:
+        rotation = int(stream_tags["rotate"])
+        logger.info(f"[rotation] Stream rotate tag: {rotation}°")
+        return rotation
+
+    # No metadata — try YOLO person bbox to infer rotation
+    rotation = _detect_rotation_from_person_bbox(video_path)
+    if rotation is not None:
+        return rotation
+
+    # Final fallback: infer from pixel dimensions
+    w = meta.get("streams", [{}])[0].get("width", 0)
+    h = meta.get("streams", [{}])[0].get("height", 0)
+    rotation = 90 if h > w else 0
+    logger.info(f"[rotation] Dimension fallback ({w}×{h}): rotation={rotation}°")
+    return rotation
 
 
 def rotateIntrinsics(CamParams, rotation, imageSize=None):
