@@ -227,7 +227,7 @@ def run_mono_standalone(
     # Classify overlapping windows and split the video into per-exercise segments.
     # Each segment is processed independently through WHAM + optimization.
     logger.info("Segmenting session video into exercise clips ...")
-    segments = segment_session_video(video_path)  # raises RuntimeError if classifier down
+    segments = segment_session_video(video_path, video_id_str=video_name)  # raises RuntimeError if classifier down
     logger.info(f"Found {len(segments)} segment(s) to process.")
     # --------------------------------------------------------------------------
 

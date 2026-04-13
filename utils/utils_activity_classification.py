@@ -2,150 +2,78 @@ import requests
 import logging
 import os
 import subprocess
-import cv2
+import json
+import numpy as np
 from loguru import logger
 from decouple import config as env_config
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger(__name__)
 
 
-def _get_video_mime_type(video_path):
-    """Get MIME type based on file extension."""
-    ext = os.path.splitext(video_path)[1].lower()
-    mime_types = {
-        ".mp4": "video/mp4",
-        ".avi": "video/x-msvideo",
-        ".mov": "video/quicktime",
-        ".mkv": "video/x-matroska",
-        ".webm": "video/webm",
-    }
-    return mime_types.get(ext, "video/mp4")  # Default to mp4 if unknown
-
-
-def predict_activity_from_video(video_path):
+def predict_activity_from_feedbacks(feedbacks):
     """
-    Predicts the activity from a video by calling the activity classification API.
-    Also determines if a flat floor assumption is valid based on the activity.
+    Predict the activity label from a list of feedback strings by calling
+    the VideoLLaMA /predict-with-feedbacks endpoint.
 
     Args:
-        video_path (str): The path to the video file.
+        feedbacks (list): feedback strings recorded during the exercise segment
 
     Returns:
-        tuple: A tuple containing:
-            - str: The predicted activity (or None if prediction fails).
-            - bool: True if a flat floor can be assumed, False otherwise.
+        tuple: (predicted_activity, flat_floor)
+            predicted_activity — str label or None if the call fails
+            flat_floor         — always True (dataset videos have flat floors)
     """
     predicted_activity = None
-    flat_floor = False  # Default to False
-
-    # List of activities where a flat floor can be assumed
-    flat_floor_activities = [
-        "squatting",
-        "sit-to-stand",
-        "walking",
-        "running",
-        "standing",
-        "sitting",
-    ]
+    flat_floor = True
 
     try:
         videollama_base = env_config("VIDEOLLAMA_URL", default="http://localhost:8400").rstrip("/")
-        activity_api_url = f"{videollama_base}/predict"
-        logger.info(
-            f"Requesting activity prediction from {activity_api_url} for: {video_path}"
-        )
-
-        # Send video path as a form field — the VideoLLaMA container reads the
-        # file directly from the shared volume (same path in both containers).
-        data = {"video_path": os.path.abspath(video_path), "fps": "3", "max_frames": "20"}
+        activity_api_url = f"{videollama_base}/predict-with-feedbacks"
+        data = {"feedbacks": ", ".join(feedbacks)}
         response = requests.post(activity_api_url, data=data, timeout=120)
-
-        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
-        activity_data = response.json()
-        predicted_activity = activity_data.get("predicted_activity")
+        response.raise_for_status()
+        predicted_activity = response.json().get("predicted_activity")
         logger.info(f"Predicted activity: {predicted_activity}")
 
-        # Handle activities with slashes (e.g., "Squatting/Sit-to-stand")
-        # Split by "/" and check if any part matches the allowed activities
-        activity_parts = [
-            part.strip().lower() for part in predicted_activity.split("/")
-        ]
-        matches_allowed_activity = any(
-            part in flat_floor_activities for part in activity_parts
-        )
-        has_one_leg = "1 leg" in predicted_activity.lower()
-
-        if matches_allowed_activity and not has_one_leg:
-            flat_floor = True
-            logger.info(
-                f"Activity '{predicted_activity}' allows for flat floor assumption."
-            )
-        else:
-            logger.info(
-                f"Activity '{predicted_activity}' does not allow for flat floor assumption."
-            )
-
     except requests.exceptions.ConnectionError:
-        logger.error(
-            f"Connection to activity classifier at {activity_api_url} failed. Is the service running?"
-        )
-    except FileNotFoundError:
-        logger.error(f"Video file not found: {video_path}")
+        logger.error(f"Connection to activity classifier at {activity_api_url} failed. Is the service running?")
     except requests.exceptions.HTTPError as e:
-        # HTTPError is raised by response.raise_for_status() for 4xx/5xx status codes
-        response = e.response
-        if response is not None:
-            status_code = response.status_code
-            try:
-                response_text = response.text
-            except Exception:
-                response_text = "Could not read response text"
-            logger.error(
-                f"HTTP error {status_code} from activity classifier at {activity_api_url}: {e}"
-            )
-            logger.error(f"Response text: {response_text}")
-        else:
-            logger.error(
-                f"HTTP error from activity classifier at {activity_api_url}: {e}"
-            )
+        resp = e.response
+        logger.error(f"HTTP error {resp.status_code if resp else '?'} from activity classifier: {e}")
     except requests.exceptions.RequestException as e:
-        # For other request exceptions, try to get response details if available
-        if hasattr(e, "response") and e.response is not None:
-            status_code = e.response.status_code
-            response_text = e.response.text
-            logger.error(
-                f"Request error {status_code} from activity classifier at {activity_api_url}: {e}"
-            )
-            logger.error(f"Response text: {response_text}")
-        else:
-            logger.error(f"Could not get activity prediction: {e}")
+        logger.error(f"Could not get activity prediction: {e}")
 
     return predicted_activity, flat_floor
 
 
-import subprocess
-import json
-import requests
-import logging
-
-logger = logging.getLogger(__name__)
-
-
 # ---------------------------------------------------------------------------
-# Session video segmentation
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _get_video_fps_and_duration(video_path):
-    """Return (fps, duration_seconds) for a video file."""
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    cap.release()
-    duration_s = frame_count / fps if fps > 0 else 0.0
+    """Return (fps, duration_seconds) using ffprobe (cv2 frame count is unreliable for AVI)."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate,nb_frames:format=duration",
+            "-of", "json",
+            video_path,
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    info = json.loads(result.stdout)
+    stream = info.get("streams", [{}])[0]
+
+    num, den = (int(x) for x in stream.get("r_frame_rate", "0/1").split("/"))
+    fps = num / den if den else 0.0
+
+    duration_s = float(info.get("format", {}).get("duration", 0) or 0)
+    if duration_s == 0 and fps > 0:
+        duration_s = int(stream.get("nb_frames", 0) or 0) / fps
+
     return fps, duration_s
 
 
@@ -165,179 +93,119 @@ def _trim_clip(video_path, start_s, end_s, output_path):
     )
 
 
-def _concat_clip_sources(clip_sources, output_path, clips_dir):
+# ---------------------------------------------------------------------------
+# Timestamp / event extraction
+# ---------------------------------------------------------------------------
+
+def get_video_events(video_id_str, json_path, base_npy_path):
     """
-    Concatenate (and trim where necessary) a list of clip sources.
+    Extract event timestamps and associated feedback from the dataset metadata.
 
     Args:
-        clip_sources: list of (clip_path, rel_start_s, rel_end_s) — rel times
-                      are relative to the start of that clip file
-        output_path:  destination file for the concatenated result
-        clips_dir:    directory used for temporary trim files (same filesystem
-                      as clips, avoids cross-device move errors)
-    """
-    working_files = []  # files to pass to the concat demuxer
-    temp_files = []     # intermediate trim files to delete after concat
-
-    for clip_path, rel_start, rel_end in clip_sources:
-        cap = cv2.VideoCapture(clip_path)
-        clip_fps = cap.get(cv2.CAP_PROP_FPS)
-        clip_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        cap.release()
-        clip_dur = clip_frames / clip_fps if clip_fps > 0 else 0
-
-        needs_trim = rel_start > 0.05 or (clip_dur - rel_end) > 0.05
-        if needs_trim:
-            tmp_path = os.path.join(clips_dir, f"_tmp_{os.path.basename(clip_path)}")
-            _trim_clip(clip_path, rel_start, rel_end, tmp_path)
-            working_files.append(tmp_path)
-            temp_files.append(tmp_path)
-        else:
-            working_files.append(clip_path)
-
-    list_path = os.path.join(clips_dir, "_concat_list.txt")
-    temp_files.append(list_path)
-    with open(list_path, "w") as f:
-        for p in working_files:
-            f.write(f"file '{os.path.abspath(p)}'\n")
-
-    try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-             "-i", list_path, "-c", "copy", output_path],
-            check=True, capture_output=True,
-        )
-        logger.info(f"[segmentation] Merged clip → {output_path}")
-    finally:
-        for p in temp_files:
-            if os.path.exists(p):
-                os.remove(p)
-
-
-def _merge_window_labels(window_labels):
-    """
-    Convert window classifications into activity segments, handling compound
-    labels (e.g. "walk,jump") by splitting the window proportionally.
-
-    A compound label with n activities divides the window into n equal parts,
-    one per activity in order of appearance.  This means boundary accuracy is
-    window_size / n — the smaller the window, the more precise the boundary.
-
-    Example with 10s windows:
-        Window  0–10s  "walk"       → walk  0–10s
-        Window 10–20s  "walk/jump"  → walk 10–15s, jump 15–20s
-        Window 20–30s  "jump"       → jump 20–30s
-
-    After merging consecutive same-label parts:
-        walk:  0–15s   (from clip_0000[0:10s] + clip_0001[0:5s])
-        jump: 15–30s   (from clip_0001[5:10s] + clip_0002[0:10s])
-
-    Args:
-        window_labels: list of (start_s, end_s, label, clip_path)
+        video_id_str:  4-digit string identifying the video (e.g. "0000")
+        json_path:     path to feedbacks_long_range.json
+        base_npy_path: directory containing {video_id_str}_timestamps.npy files
 
     Returns:
-        list of (start_s, end_s, label, clip_sources) where
-        clip_sources = [(clip_path, rel_start_s, rel_end_s), ...]
+        (events, timestamp_duration)
+            events — list of {start_s, end_s, unique_feedbacks} dicts,
+                     with times relative to the first npy timestamp
+            timestamp_duration — total span of the npy timestamps in seconds
     """
-    if not window_labels:
-        return []
+    with open(json_path, "r") as f:
+        all_json_data = json.load(f)
 
-    # Expand each window into one sub-segment per activity in its label,
-    # recording which portion of the clip file each sub-segment corresponds to.
-    sub_segments = []
-    for start_s, end_s, label, clip_path in window_labels:
-        parts = [p.strip().lower() for p in label.split(",") if p.strip()]
-        n = len(parts)
-        l = end_s - start_s
-        for i, part in enumerate(parts):
-            sub_segments.append((
-                start_s + i * l / n,        # absolute start
-                start_s + (i + 1) * l / n,  # absolute end
-                part,
-                clip_path,
-                i * l / n,                  # rel_start within clip
-                (i + 1) * l / n,            # rel_end within clip
-            ))
+    data_item = next(
+        (item for item in all_json_data
+         if isinstance(item, dict)
+         and item.get("long_range_video_file") == f"./long_range_videos/{video_id_str}.mp4"),
+        None,
+    )
+    if data_item is None:
+        logging.error(f"Data for video ID '{video_id_str}' not found in JSON.")
+        return [], 0
 
-    # Merge consecutive sub-segments with the same label
-    segments = []
-    seg_start_s = sub_segments[0][0]
-    seg_label = sub_segments[0][2]
-    seg_clips = [(sub_segments[0][3], sub_segments[0][4], sub_segments[0][5])]
+    is_transition_list      = data_item.get("is_transition", [])
+    feedback_timestamps_list = data_item.get("feedback_timestamps", [])
+    feedbacks_list           = data_item.get("feedbacks", [])
 
-    for start_s, end_s, label, clip_path, rel_start, rel_end in sub_segments[1:]:
-        if label != seg_label:
-            segments.append((seg_start_s, start_s, seg_label, seg_clips))
-            seg_start_s = start_s
-            seg_label = label
-            seg_clips = [(clip_path, rel_start, rel_end)]
+    if not is_transition_list or not feedback_timestamps_list or not feedbacks_list:
+        logging.error(f"Missing fields for video ID '{video_id_str}'.")
+        return [], 0
+
+    npy_path = os.path.join(base_npy_path, f"{video_id_str}_timestamps.npy")
+    if not os.path.exists(npy_path):
+        logging.error(f"NPY file not found: {npy_path}")
+        return [], 0
+
+    timestamps_raw = np.load(npy_path)
+    video_ts_sec = timestamps_raw / 1e9 + 28800
+    timestamp_duration = float(video_ts_sec[-1] - video_ts_sec[0]) if len(video_ts_sec) > 0 else 0
+
+    # Build (start, end) pairs from consecutive True entries in is_transition
+    event_timestamps = []
+    start_ts = None
+    for is_trans, ts in zip(is_transition_list, feedback_timestamps_list):
+        if is_trans:
+            if start_ts is None:
+                start_ts = ts
+            else:
+                event_timestamps.append((start_ts, ts))
+                start_ts = ts
+
+    events = []
+    t0 = video_ts_sec[0]
+    for i, (start_ts, end_ts) in enumerate(event_timestamps):
+        start_idx = np.searchsorted(video_ts_sec, start_ts, side="left")
+        end_idx   = np.searchsorted(video_ts_sec, end_ts,   side="right") - 1
+
+        if start_idx < len(feedbacks_list) and end_idx >= 0 and start_idx <= end_idx:
+            raw_feedbacks = feedbacks_list[start_idx: end_idx + 1]
+            unique_feedbacks = sorted(set(f for f in raw_feedbacks if f))
+            events.append({
+                "start_s": start_ts - t0,
+                "end_s":   end_ts   - t0,
+                "unique_feedbacks": unique_feedbacks,
+            })
         else:
-            seg_clips.append((clip_path, rel_start, rel_end))
+            logging.warning(f"No valid feedback range for event {i+1}. Skipping.")
 
-    segments.append((seg_start_s, sub_segments[-1][1], seg_label, seg_clips))
-    return segments
+    logging.info(f"Video ID '{video_id_str}': {len(events)} events, timestamp span {timestamp_duration:.2f}s")
+    return events, timestamp_duration
 
+
+# ---------------------------------------------------------------------------
+# Segmentation
+# ---------------------------------------------------------------------------
 
 def segment_session_video(
     video_path,
-    window_size_s=10,
-    min_segment_s=5,
+    video_id_str="0000",
+    json_path="/ceph/Dataset/QEVD-FIT-COACH/feedbacks_long_range.json",
+    npy_base_path="/ceph/Dataset/QEVD-FIT-COACH/long_range_videos/",
 ):
     """
-    Segment a session video into labelled exercise clips.
+    Segment a session video into labelled exercise clips using dataset metadata.
 
-    Divides the video into non-overlapping fixed-length windows and classifies
-    each with the VideoLLaMA activity classifier. Consecutive windows with the
-    same label are merged into a single segment. Short 'other' segments
-    (< min_segment_s) are dropped.
-
-    Args:
-        video_path:     path to the input video
-        window_size_s:  duration of each classification window in seconds
-        min_segment_s:  minimum duration to keep an 'other' segment
+    Event boundaries come from the transition timestamps in the npy file.
+    Instead of re-encoding the video, timestamp times are scaled to match the
+    actual video duration so the original file can be trimmed directly.
 
     Returns:
-        list of dicts, each with keys:
-            start_s, end_s       — segment time range in seconds
-            start_frame, end_frame — corresponding frame indices
-            label                — predicted activity string
-
-    Raises:
-        RuntimeError: if the classifier is unreachable (fail fast — all
-                      segments must be labelled for the pipeline to proceed)
+        list of (start_s, end_s, start_frame, end_frame, label, clip_path) tuples
     """
+    video_events, target_duration = get_video_events(video_id_str, json_path, npy_base_path)
+
     fps, duration_s = _get_video_fps_and_duration(video_path)
+    scale = duration_s / target_duration if target_duration > 0 else 1.0
     logger.info(
-        f"[segmentation] Video: {duration_s:.1f}s at {fps:.1f}fps | window={window_size_s}s"
+        f"[segmentation] Video: {duration_s:.1f}s at {fps:.1f}fps | "
+        f"timestamp span: {target_duration:.1f}s | scale: {scale:.4f}"
     )
 
-    # Short video — classify as a single segment without windowing
-    if duration_s < window_size_s:
-        logger.info("[segmentation] Video shorter than one window, treating as single segment")
-        label, _ = predict_activity_from_video(video_path)
-        if label is None:
-            raise RuntimeError(
-                "Activity classifier unreachable. Cannot segment video. "
-                "Check that the VideoLLaMA service is running."
-            )
-        return [{
-            "start_s": 0.0,
-            "end_s": duration_s,
-            "start_frame": 0,
-            "end_frame": int(duration_s * fps),
-            "label": label,
-        }]
-
-    # Non-overlapping windows; include a trailing partial window if long enough
-    starts = []
-    t = 0.0
-    while t + window_size_s <= duration_s:
-        starts.append(t)
-        t += window_size_s
-    if t < duration_s and (duration_s - t) >= min_segment_s:
-        starts.append(t)
-
-    logger.info(f"[segmentation] Classifying {len(starts)} windows ...")
+    for event in video_events:
+        event["start_s"] *= scale
+        event["end_s"]   *= scale
 
     clips_dir = os.path.join("output_videos", "clips")
     if os.path.exists(clips_dir):
@@ -347,98 +215,44 @@ def segment_session_video(
     os.makedirs(clips_dir, exist_ok=True)
     video_stem = os.path.splitext(os.path.basename(video_path))[0]
 
-    window_labels = []
-    for i, start_s in enumerate(starts):
-        end_s = min(start_s + window_size_s, duration_s)
+    if not video_events:
+        logger.warning(f"No video events found for video ID '{video_id_str}'.")
+        return []
+
+    logger.info(f"[segmentation] Processing {len(video_events)} segment(s) ...")
+    segments = []
+    for i, event in enumerate(video_events):
+        start_s   = event["start_s"]
+        end_s     = event["end_s"]
+        feedbacks = event["unique_feedbacks"]
+        feedback_str = ", ".join(feedbacks) if feedbacks else "no feedback"
+        logger.info(f"[segmentation] Event {i}: {start_s:.1f}–{end_s:.1f}s | {feedback_str}")
+
         clip_path = os.path.join(clips_dir, f"{video_stem}_clip_{i:04d}_{int(start_s)}s.mp4")
         _trim_clip(video_path, start_s, end_s, clip_path)
 
-        label, _ = predict_activity_from_video(clip_path)
-
+        label, _ = predict_activity_from_feedbacks(feedbacks)
         if label is None:
             raise RuntimeError(
-                f"Activity classifier unreachable at window {i} "
-                f"({start_s:.1f}–{end_s:.1f}s). Cannot segment video. "
-                "Check that the VideoLLaMA service is running."
+                f"Activity classifier unreachable at event {i} "
+                f"({start_s:.1f}–{end_s:.1f}s). Check that the VideoLLaMA service is running."
             )
 
-        logger.info(f"[segmentation] Window {i:3d}: {start_s:6.1f}–{end_s:6.1f}s → '{label}' ({clip_path})")
-        window_labels.append((start_s, end_s, label, clip_path))
-
-    # Merge consecutive same-label windows into segments
-    raw_segments = _merge_window_labels(window_labels)
-
-    # Collect all window clip paths for cleanup after segments are built
-    all_window_clips = [clip_path for _, _, _, clip_path in window_labels]
-
-    # Filter, concatenate clips, and convert to output format
-    segments = []
-    seg_idx = 0
-    for start_s, end_s, label, clip_sources in raw_segments:
-        duration = end_s - start_s
-        is_other = label.lower() in ("other", "none", "unknown")
-        if is_other and duration < min_segment_s:
-            logger.info(
-                f"[segmentation] Dropping short '{label}' segment "
-                f"{start_s:.1f}–{end_s:.1f}s ({duration:.1f}s < {min_segment_s}s)"
-            )
-            continue
-
-        merged_clip = os.path.join(
-            clips_dir, f"{video_stem}_seg_{seg_idx:02d}_{label}.mp4"
-        )
-        _concat_clip_sources(clip_sources, merged_clip, clips_dir)
-        seg_idx += 1
-
+        logger.info(f"[segmentation] Event {i:3d}: {start_s:6.1f}–{end_s:6.1f}s → '{label}'")
         segments.append({
-            "start_s": start_s,
-            "end_s": end_s,
+            "start_s":     start_s,
+            "end_s":       end_s,
             "start_frame": int(start_s * fps),
-            "end_frame": int(end_s * fps),
-            "label": label,
-            "clip_path": merged_clip,
+            "end_frame":   int(end_s * fps),
+            "label":       label,
+            "clip_path":   clip_path,
         })
 
-    # Delete all window clips now that segments have been merged
-    for clip_path in all_window_clips:
-        if os.path.exists(clip_path):
-            os.remove(clip_path)
-    logger.info(f"[segmentation] Deleted {len(all_window_clips)} window clip(s)")
-
-    logger.info(f"[segmentation] {len(segments)} segment(s) after filtering:")
+    logger.info(f"[segmentation] {len(segments)} segment(s):")
     for i, seg in enumerate(segments):
-        logger.info(
-            f"[segmentation]   [{i}] {seg['start_s']:.1f}–{seg['end_s']:.1f}s "
-            f"({seg['end_s']-seg['start_s']:.1f}s) '{seg['label']}'"
-        )
+        logger.info(f"[segmentation]   [{i}] {seg['start_s']:.1f}–{seg['end_s']:.1f}s ({seg['end_s']-seg['start_s']:.1f}s) '{seg['label']}'")
 
     return segments
-
-
-def get_rotation_metadata(video_path):
-    try:
-        cmd = [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream_tags=rotate",
-            "-of",
-            "json",
-            video_path,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(result.stdout)
-        rotate_tag = data.get("streams", [{}])[0].get("tags", {}).get("rotate")
-        if rotate_tag:
-            rotation_angle = int(rotate_tag)
-            logger.info(f"Rotation metadata found: {rotation_angle} degrees")
-            return rotation_angle
-    except Exception as e:
-        logger.warning(f"No rotation metadata found or ffprobe failed: {e}")
-    return None
 
 
 if __name__ == "__main__":

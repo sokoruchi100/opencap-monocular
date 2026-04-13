@@ -3,7 +3,6 @@ import traceback
 from loguru import logger
 import utils.utils_optim as ut
 from utils.optimization_formulations import OptimizeExtrinsics, OptimizePose
-from utils.utils_activity_classification import predict_activity_from_video
 from utils.utils_vis import (
     plot_objective_function,
     plot_3d_keypoints_interactive_plotly,
@@ -414,27 +413,12 @@ def run_optimization(
     if activity is not None:
         predicted_activity = activity
         activity_detection_method = "user_provided"
-        flat_floor = (
-            True
-            if activity.lower() == "squat"
-            or activity.lower() == "sts"
-            or activity.lower() == "walking"
-            else False
-        )
+        flat_floor = activity not in {"cycling", "sitting", "climbing", "descending", "other"}
     else:
-        try:
-            predicted_activity, flat_floor = predict_activity_from_video(video_path)
-            logger.info(
-                f"Predicted activity using Video Activity Classifier: {predicted_activity}"
-            )
-            if predicted_activity is not None:
-                activity_detection_method = "video_classifier"
-                if "walking" in predicted_activity.lower():
-                    is_gait = True
-        except Exception as e:
-            logger.error(f"Error predicting activity: {e}")
-            predicted_activity = None
-            flat_floor = False
+        logger.info("No activity provided, using ankle velocity heuristic for activity detection.")
+        if is_gait:
+            predicted_activity = "walking"
+            activity_detection_method = "ankle_velocity_heuristic"
 
     # Load parameters from YAML file
     with open("params/parameters.yaml", "r") as f:
