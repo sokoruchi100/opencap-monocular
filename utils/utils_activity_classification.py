@@ -154,22 +154,23 @@ def get_video_events(video_id_str, json_path, base_npy_path):
                 start_ts = ts
 
     events = []
-    t0 = video_ts_sec[0]
+    frame_rate = 30.0
     for i, (start_ts, end_ts) in enumerate(event_timestamps):
-        start_idx = np.searchsorted(video_ts_sec, start_ts, side="left")
-        end_idx   = np.searchsorted(video_ts_sec, end_ts,   side="right") - 1
+        closest_start_frame_idx = np.argmin(np.abs(start_ts - video_ts_sec))
+        closest_end_frame_idx = np.argmin(np.abs(end_ts - video_ts_sec))
 
-        if start_idx < len(feedbacks_list) and end_idx >= 0 and start_idx <= end_idx:
-            raw_feedbacks = feedbacks_list[start_idx: end_idx + 1]
-            unique_feedbacks = sorted(set(f for f in raw_feedbacks if f))
-            events.append({
-                "start_s": start_ts - t0,
-                "end_s":   end_ts   - t0,
-                "unique_feedbacks": unique_feedbacks,
-            })
-        else:
-            logging.warning(f"No valid feedback range for event {i+1}. Skipping.")
+        event_feedbacks = feedbacks_list[closest_start_frame_idx : closest_end_frame_idx + 1]
+        unique_non_empty_feedbacks = sorted(list(set(f for f in event_feedbacks if f)))
 
+        start_time_video_sec = closest_start_frame_idx / frame_rate
+        end_time_video_sec = closest_end_frame_idx / frame_rate
+
+        events.append({
+            'start_time_sec': start_time_video_sec,
+            'end_time_sec': end_time_video_sec,
+            'unique_feedbacks': unique_non_empty_feedbacks
+        })
+        
     logging.info(f"Video ID '{video_id_str}': {len(events)} events, timestamp span {timestamp_duration:.2f}s")
     return events, timestamp_duration
 
@@ -188,8 +189,6 @@ def segment_session_video(
     Segment a session video into labelled exercise clips using dataset metadata.
 
     Event boundaries come from the transition timestamps in the npy file.
-    Instead of re-encoding the video, timestamp times are scaled to match the
-    actual video duration so the original file can be trimmed directly.
 
     Returns:
         list of (start_s, end_s, start_frame, end_frame, label, clip_path) tuples
@@ -197,15 +196,10 @@ def segment_session_video(
     video_events, target_duration = get_video_events(video_id_str, json_path, npy_base_path)
 
     fps, duration_s = _get_video_fps_and_duration(video_path)
-    scale = duration_s / target_duration if target_duration > 0 else 1.0
     logger.info(
         f"[segmentation] Video: {duration_s:.1f}s at {fps:.1f}fps | "
-        f"timestamp span: {target_duration:.1f}s | scale: {scale:.4f}"
+        f"timestamp span: {target_duration:.1f}s"
     )
-
-    for event in video_events:
-        event["start_s"] *= scale
-        event["end_s"]   *= scale
 
     clips_dir = os.path.join("output_videos", "clips")
     if os.path.exists(clips_dir):
@@ -222,8 +216,8 @@ def segment_session_video(
     logger.info(f"[segmentation] Processing {len(video_events)} segment(s) ...")
     segments = []
     for i, event in enumerate(video_events):
-        start_s   = event["start_s"]
-        end_s     = event["end_s"]
+        start_s   = event["start_time_sec"]
+        end_s     = event["end_time_sec"]
         feedbacks = event["unique_feedbacks"]
         feedback_str = ", ".join(feedbacks) if feedbacks else "no feedback"
         logger.info(f"[segmentation] Event {i}: {start_s:.1f}–{end_s:.1f}s | {feedback_str}")
