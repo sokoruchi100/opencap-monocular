@@ -4,3 +4,6 @@
 [submodule "WHAM/third-party/ViTPose"]
 	path = WHAM/third-party/ViTPose
 	url = https://github.com/ViTAE-Transformer/ViTPose.git
+[submodule "MS-Human-700"]
+	path = MS-Human-700
+	url = ./MS-Human-700

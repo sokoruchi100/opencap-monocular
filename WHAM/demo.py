@@ -33,6 +33,8 @@ from lib.models.preproc.detector import DetectionModel
 from lib.models.preproc.extractor import FeatureExtractor
 from lib.models.smplify import TemporalSMPLify
 
+from SMPL_length_extractor import extract_SMPL_length
+
 try:
     from utils.utils_optim import load_intrinsics
 except ImportError:
@@ -241,6 +243,9 @@ def run(cfg,
                 avg_pose, avg_shape = avg_preds(pose, shape, flipped_pose, flipped_shape)
                 avg_pose = avg_pose.reshape(-1, 144)
                 avg_contact = (flipped_pred['contact'][..., [2, 3, 0, 1]] + pred['contact']) / 2
+
+                # Run SMPL Length Extraction Process
+                extract_SMPL_length(avg_shape)
 
                 # Refine trajectory with merged prediction
                 network.pred_pose = avg_pose.view_as(network.pred_pose)
