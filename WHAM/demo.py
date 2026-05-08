@@ -33,7 +33,14 @@ from lib.models.preproc.detector import DetectionModel
 from lib.models.preproc.extractor import FeatureExtractor
 from lib.models.smplify import TemporalSMPLify
 
-from SMPL_length_extractor import extract_SMPL_length
+from MS_SMPL_Scaler import (
+    extract_SMPL_length, 
+    save_mesh_obj, 
+    compute_segment_lengths, 
+    compute_scale_factors, 
+    scale_MS_model, 
+    validate_scaled_model
+)
 
 try:
     from utils.utils_optim import load_intrinsics
@@ -244,8 +251,16 @@ def run(cfg,
                 avg_pose = avg_pose.reshape(-1, 144)
                 avg_contact = (flipped_pred['contact'][..., [2, 3, 0, 1]] + pred['contact']) / 2
 
-                # Run SMPL Length Extraction Process
-                extract_SMPL_length(avg_shape)
+                # Run SMPL Length Extraction
+                J, height, shaped_mesh, faces = extract_SMPL_length(avg_shape)
+                
+                # Testing Purposes
+                save_mesh_obj(shaped_mesh, faces, "MS-Scaled/smpl_shaped.obj")
+
+                # Compute bone lengths and scale factors, then scale the MS-Human model
+                SMPL_bone_lengths = compute_segment_lengths(J)
+                root, scale_factors = compute_scale_factors(SMPL_bone_lengths)
+                path_to_scaled_xml = scale_MS_model(root, scale_factors)
 
                 # Refine trajectory with merged prediction
                 network.pred_pose = avg_pose.view_as(network.pred_pose)

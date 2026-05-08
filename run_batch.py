@@ -24,6 +24,12 @@ import traceback
 from loguru import logger
 
 from run_mono_standalone import METADATA_PATH, run_mono_standalone
+import subprocess
+
+# Full path to the python executable in the other environment
+VIDEOLLAMA3_PYTHON = "/home/dct55/miniconda3/envs/video-llama-3/bin/python"
+CLASSIFIER_SCRIPT = "./VideoLLaMA3/activity_classifier_server.py"
+
 
 VIDEO_DIR = "/ceph/Dataset/QEVD-FIT-COACH/long_range_videos/"
 CALIB_PATH = ""  # no calibration file for this dataset
@@ -68,6 +74,14 @@ def main():
             sys.exit(1)
         video_paths.append(path)
 
+    # Run the classifier server in the other environment
+    process = subprocess.Popen(
+        [VIDEOLLAMA3_PYTHON, "-u", CLASSIFIER_SCRIPT], 
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
     # Load WHAM once for all videos
     try:
         from WHAM.demo import initialize_wham
@@ -102,6 +116,8 @@ def main():
     logger.info(f"\nBatch complete: {len(ok)}/{len(video_paths)} succeeded, {len(failed)} failed.")
     for r in failed:
         logger.error(f"  FAILED: {r['video']}")
+    
+    process.terminate()  # Stop the classifier server
 
 
 if __name__ == "__main__":
