@@ -1,12 +1,17 @@
+import joblib
+import numpy as np
+from scipy.spatial.transform import Rotation
 import pickle
 import numpy as np
 import torch
 import xml.etree.ElementTree as ET
 import os
 import shutil
+import mujoco
+import time
 
-def extract_SMPL_length(beta):
-    with open("./WHAM/dataset/body_models/smpl/SMPL_NEUTRAL.pkl", "rb") as f:
+def extract_SMPL_length(beta, path="./WHAM/dataset/body_models/smpl/SMPL_NEUTRAL.pkl"):
+    with open(path, "rb") as f:
         SMPL = pickle.load(f, encoding="latin1")
 
     v_template = np.array(SMPL.get('v_template'))
@@ -255,11 +260,186 @@ def validate_scaled_model(SMPL_bone_lengths, path):
     # Recompute the bone lengths from the scaled model and print ratios to verify correctness, should be close to 1.0 if scaling was done correctly
     print(compute_scale_factors(SMPL_bone_lengths, path)[1])
 
+# Coordinate transform: SMPL (X=lateral, Y=up, Z=posterior) → MS ISB (X=anterior, Y=up, Z=lateral)
+_T = np.array([[0., 0., 1.],
+               [0., 1.,  0.],
+               [1., 0.,  0.]])
+
+# MS joint axes from XML, keyed by DOF name.
+# Bilateral joints: {'l': array, 'r': array}. Spine: plain array.
+MS_JOINT_AXES = {
+    'hip_flexion':         {'l': np.array([ 0.,  0.,  1.]), 'r': np.array([ 0.,  0.,  1.])},
+    'hip_adduction':       {'l': np.array([-1.,  0.,  0.]), 'r': np.array([ 1.,  0.,  0.])},
+    'hip_rotation':        {'l': np.array([ 0., -1.,  0.]), 'r': np.array([ 0.,  1.,  0.])},
+    'knee_angle':          {'l': np.array([ 0., 0.0707131,  -0.997497]), 'r': np.array([ 0.,  -0.0707131,  -0.997497])},
+    'ankle_angle':         {'l': np.array([ 0.105014,  0.174022,  0.979126]), 'r': np.array([-0.105014, -0.174022,  0.979126])},
+    'subtalar_angle':      {'l': np.array([-0.78718,  -0.604747, -0.120949]), 'r': np.array([ 0.78718,   0.604747, -0.120949])},
+    'mtp_angle':           {'l': np.array([-0.580954,  0.,       -0.813936]), 'r': np.array([ 0.580954,  0.,       -0.813936])},
+    'sternoclavicular_r2': {'l': np.array([-0.0153,   -0.989299, -0.1451  ]), 'r': np.array([ 0.0153,    0.989299, -0.1451  ])},
+    'sternoclavicular_r3': {'l': np.array([ 0.994473,  0.,       -0.104997]), 'r': np.array([-0.994473,  0.,       -0.104997])},
+    'elv_angle':           {'l': np.array([-0.0048,   -0.999089,  0.0424  ]), 'r': np.array([ 0.0048,    0.999089,  0.0424  ])},
+    'shoulder_elv':        {'l': np.array([ 0.998261, -0.0023,    0.058898]), 'r': np.array([-0.998261,  0.0023,    0.058898])},
+    'shoulder_rot':        {'l': np.array([-0.0048,   -0.999089,  0.0424  ]), 'r': np.array([ 0.0048,    0.999089,  0.0424  ])},
+    'elbow_flexion':       {'l': np.array([-0.0494,   -0.0366,    0.998108]), 'r': np.array([ 0.0494,    0.0366,    0.998108])},
+    'pro_sup':             {'l': np.array([ 0.017161, -0.992666, -0.119668]), 'r': np.array([-0.017161,  0.992666, -0.119668])},
+    'deviation':           {'l': np.array([ 0.819064,  0.135611, -0.557444]), 'r': np.array([-0.819064, -0.135611, -0.557444])},
+    'wrist_flexion':       {'l': np.array([-0.956427,  0.252207,  0.147104]), 'r': np.array([ 0.956427, -0.252207,  0.147104])},
+    'spine_FE':            np.array([0., 0., 1.]),
+    'spine_LB':            np.array([1., 0., 0.]),
+    'spine_AR':            np.array([0., 1., 0.]),
+}
+# Pre-normalise all axes
+for _k, _v in MS_JOINT_AXES.items():
+    if isinstance(_v, dict):
+        MS_JOINT_AXES[_k] = {s: a / np.linalg.norm(a) for s, a in _v.items()}
+    else:
+        MS_JOINT_AXES[_k] = _v / np.linalg.norm(_v)
+
+# Rest-pose corrections: (sign, offset) applied as  angle = sign*raw + offset
+# Needed where SMPL's T-pose rest differs from MS's qpos=0 rest.
+# shoulder_elv: SMPL T-pose has arms horizontal (π/2 in MS); MS qpos=0 has arms hanging.
+#   corrected = π/2 - raw  →  sign=-1, offset=π/2
+SMPL_DOF_CORRECTIONS = {
+    'shoulder_elv':  (-1, np.pi / 2),   # SMPL T-pose arms horizontal; MS rest arms-down
+    'elv_angle':     ( 1, -np.pi / 10), # SMPL T-pose plane offset: coronal plane is -pi/10 in MS
+    'elbow_flexion': (-1, 0.0),          # SMPL flexion sign is opposite to MS axis direction
+}
+
+# SMPL joint index → MS joint mapping.
+# Each entry: (smpl_start, side, [(dof_name, ms_joint_name), ...])
+# side is 'l', 'r', or None for spine.
+SMPL_JOINT_MAP = [
+    ( 3, 'l', [('hip_flexion', 'hip_flexion_l'), ('hip_adduction', 'hip_adduction_l'), ('hip_rotation', 'hip_rotation_l')]),
+    ( 6, 'r', [('hip_flexion', 'hip_flexion_r'), ('hip_adduction', 'hip_adduction_r'), ('hip_rotation', 'hip_rotation_r')]),
+    ( 9, None,[('spine_FE', 'L5_S1_FE'),   ('spine_LB', 'L5_S1_LB'),   ('spine_AR', 'L5_S1_AR')]),
+    (12, 'l', [('knee_angle', 'knee_angle_l')]),
+    (15, 'r', [('knee_angle', 'knee_angle_r')]),
+    (18, None,[('spine_FE', 'T12_L1_FE'),  ('spine_LB', 'T12_L1_LB'),  ('spine_AR', 'T12_L1_AR')]),
+    (21, 'l', [('ankle_angle', 'ankle_angle_l'), ('subtalar_angle', 'subtalar_angle_l')]),
+    (24, 'r', [('ankle_angle', 'ankle_angle_r'), ('subtalar_angle', 'subtalar_angle_r')]),
+    (27, None,[('spine_FE', 'T1_head_neck_FE'), ('spine_LB', 'T1_head_neck_LB'), ('spine_AR', 'T1_head_neck_AR')]),
+    (30, 'l', [('mtp_angle', 'mtp_angle_l')]),
+    (33, 'r', [('mtp_angle', 'mtp_angle_r')]),
+    (39, 'l', [('sternoclavicular_r2', 'sternoclavicular_r2_l'), ('sternoclavicular_r3', 'sternoclavicular_r3_l')]),
+    (42, 'r', [('sternoclavicular_r2', 'sternoclavicular_r2_r'), ('sternoclavicular_r3', 'sternoclavicular_r3_r')]),
+    (48, 'l', [('elv_angle', 'elv_angle_l'), ('shoulder_elv', 'shoulder_elv_l'), ('shoulder_rot', 'shoulder_rot_l')]),
+    (51, 'r', [('elv_angle', 'elv_angle_r'), ('shoulder_elv', 'shoulder_elv_r'), ('shoulder_rot', 'shoulder_rot_r')]),
+    (54, 'l', [('elbow_flexion', 'elbow_flexion_l'), ('pro_sup', 'pro_sup_l')]),
+    (57, 'r', [('elbow_flexion', 'elbow_flexion_r'), ('pro_sup', 'pro_sup_r')]),
+    (60, 'l', [('deviation', 'deviation_l'), ('wrist_flexion', 'flexion_l')]),
+    (63, 'r', [('deviation', 'deviation_r'), ('wrist_flexion', 'flexion_r')]),
+]
+
+def smpl_root_to_pelvis_joints(R_world, trans_world):
+    """
+    R_world     : (N, 3, 3) pelvis rotation matrix in SMPL world frame (poses_root_world)
+    trans_world : (N, 3)    pelvis translation in SMPL world frame (trans_world)
+    returns     : dict mapping MS pelvis joint names → (N,) displacement/angle arrays
+
+    MS-Human-700 root DOF breakdown (all scalar joints):
+      pelvis_tx/ty/tz  — slide joints along X/Y/Z axes
+      pelvis_tilt      — hinge around Z  (frontal tilt)
+      pelvis_list      — hinge around X  (lateral list)
+      pelvis_rotation  — hinge around Y  (axial rotation)
+    """
+    R_world     = np.asarray(R_world)
+    trans_world = np.asarray(trans_world, dtype=float)
+
+    # Remap SMPL world axes to MS world axes (swaps X ↔ Z)
+    trans_ms = trans_world @ _T.T   # (N, 3)
+
+    # Rotate orientation into MS world frame, then project onto each hinge axis
+    R_ms = _T @ R_world @ _T.T     # (N, 3, 3)
+    rv   = Rotation.from_matrix(R_ms).as_rotvec()  # (N, 3)
+
+    return {
+        'pelvis_tx':       trans_ms[:, 0],
+        'pelvis_ty':       trans_ms[:, 1],
+        'pelvis_tz':       trans_ms[:, 2],
+        'pelvis_tilt':     np.einsum('ni,i->n', rv, np.array([0., 0., 1.])),
+        'pelvis_list':     np.einsum('ni,i->n', rv, np.array([1., 0., 0.])),
+        'pelvis_rotation': np.einsum('ni,i->n', rv, np.array([0., 1., 0.])),
+    }
+
+
+def smpl_to_ms_joint(aa_smpl, dof_map, side=None):
+    """
+    aa_smpl : (N, 3) or (3,) SMPL axis-angle for one joint
+    dof_map : list of (dof_name, ms_joint_name) from SMPL_JOINT_MAP
+    side    : 'l', 'r', or None for spine
+    returns : dict {ms_joint_name: (N,) angle array}
+    """
+    R    = Rotation.from_rotvec(aa_smpl).as_matrix()
+    R_ms = _T @ R @ _T.T
+    rv   = Rotation.from_matrix(R_ms).as_rotvec()   # (..., 3)
+
+    result = {}
+    for dof_name, ms_name in dof_map:
+        ax = MS_JOINT_AXES[dof_name]
+        n  = ax[side] if isinstance(ax, dict) else ax   # already normalised
+        raw = np.einsum('...i,i->...', rv, n)
+        sign, offset = SMPL_DOF_CORRECTIONS.get(dof_name, (1, 0.0))
+        result[ms_name] = sign * raw + offset
+    return result
+
+
+# Build a full qpos sequence (N frames)
+def build_qpos_sequence(model, joint_values):
+    """
+    joint_values: dict of joint_name -> (N,) array
+    Unmapped DOFs are zeroed out. Free/ball joints get identity quaternions.
+    returns: (N, model.nq) array
+    """
+
+    N = next(iter(joint_values.values())).shape[0]
+    qpos_seq = np.zeros((N, model.nq))
+
+    # Identity quaternion for free/ball joints (w=1, xyz=0)
+    for i in range(model.njnt):
+        adr = model.jnt_qposadr[i]
+        if model.jnt_type[i] == mujoco.mjtJoint.mjJNT_FREE:
+            qpos_seq[:, adr + 3] = 1.0   # free joint: [tx ty tz qw qx qy qz]
+        elif model.jnt_type[i] == mujoco.mjtJoint.mjJNT_BALL:
+            qpos_seq[:, adr] = 1.0        # ball joint: [qw qx qy qz]
+
+    for name, values in joint_values.items():
+        try:
+            adr = model.joint(name).qposadr[0]
+            qpos_seq[:, adr] = values
+        except KeyError:
+            pass  # joint absent in this model variant
+
+    return qpos_seq
+
+def build_qpos_dict(smpl_pose):
+    joint_values = {}
+    for start, side, dof_map in SMPL_JOINT_MAP:
+        joint_values.update(smpl_to_ms_joint(smpl_pose[:, start:start+3], dof_map, side=side))
+    return joint_values
+
+def get_ms_scaled_model_and_data(path_to_scaled_model):
+    results = joblib.load("wham_output.pkl")
+    wham_data = results[0]  # subject 0
+    smpl_pose   = wham_data['pose']              # (N, 72) axis-angle
+    R_world     = wham_data['poses_root_world']  # (N, 3, 3) pelvis rotation in world
+    trans_world = wham_data['trans_world']       # (N, 3)   pelvis position in world
+
+    model = mujoco.MjModel.from_xml_path(path_to_scaled_model)
+    data  = mujoco.MjData(model)
+
+    joint_values = build_qpos_dict(smpl_pose)
+    joint_values.update(smpl_root_to_pelvis_joints(R_world, trans_world))
+    qpos_seq = build_qpos_sequence(model, joint_values)
+
+    return model, data, qpos_seq
 
 if __name__ == "__main__":
-    beta_torch = torch.zeros(10, dtype=torch.float32)
-    J, height, shaped_mesh, faces = extract_SMPL_length(beta_torch)
-    save_mesh_obj(shaped_mesh, faces, "MS-Scaled/smpl_shaped.obj")
+    results = joblib.load("wham_output.pkl")
+    data = results[0]  # subject 0
+    smpl_beta = data['betas']  # (10,) shape coefficients
+    smpl_pose = data['pose']  # (N, 72) axis-angle
+    
+    J, height, shaped_mesh, faces = extract_SMPL_length(smpl_beta, path="SMPL_NEUTRAL.pkl")
     SMPL_bone_lengths = compute_segment_lengths(J)
     root, scale_factors = compute_scale_factors(SMPL_bone_lengths)
     path_to_scaled_xml = scale_MS_model(root, scale_factors)

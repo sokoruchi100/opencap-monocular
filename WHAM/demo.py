@@ -254,8 +254,11 @@ def run(cfg,
                 # Run SMPL Length Extraction
                 J, height, shaped_mesh, faces = extract_SMPL_length(avg_shape)
                 
-                # Testing Purposes
-                save_mesh_obj(shaped_mesh, faces, "MS-Scaled/smpl_shaped.obj")
+                # Testing Purposes - for validating the scaled model
+                # save_mesh_obj(shaped_mesh, faces, "MS-Scaled/smpl_shaped.obj")
+
+                # Convert the SMPL pose to MS-Human pose
+                ms_hip_flexion, ms_hip_adduction, ms_hip_rotation = smpl_hip_to_ms(pose[0, 0:3])
 
                 # Compute bone lengths and scale factors, then scale the MS-Human model
                 SMPL_bone_lengths = compute_segment_lengths(J)
